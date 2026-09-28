@@ -525,19 +525,19 @@ canvas.plate.is-live{opacity:1}
 
 <div class="stage" id="stage">
   <video id="v1" muted playsinline preload="auto" aria-hidden="true" tabindex="-1"
-         src="./film-zhiguai.mp4"></video>
+         poster="./frame-poster.webp" data-src="./film-zhiguai.mp4"></video>
   <canvas id="c1" class="plate" width="1280" height="720" aria-hidden="true"></canvas>
 </div>
 
 <div class="reveal reveal--a" id="ra" aria-hidden="true">
   <video id="v2" muted playsinline preload="metadata" tabindex="-1"
-         src="./film-zhiguai.mp4"></video>
+         poster="./frame-poster.webp" data-src="./film-zhiguai.mp4"></video>
   <canvas id="c2" class="plate" width="1280" height="720"></canvas>
 </div>
 
 <div class="reveal reveal--b" id="rb" aria-hidden="true">
   <video id="v3" muted playsinline preload="metadata" tabindex="-1"
-         src="./film-zhiguai.mp4"></video>
+         poster="./frame-poster.webp" data-src="./film-zhiguai.mp4"></video>
   <canvas id="c3" class="plate" width="1280" height="720"></canvas>
 </div>
 
@@ -660,7 +660,7 @@ setTimeout(showPage, 2500);   // failsafe: never leave the page blank
    ──────────────────────────────────────────────────────────────── */
 function createClip(V, C){
   var ctx = C.getContext('2d', { alpha:false });
-  var url = V.getAttribute('src');      // read from markup: the two can never disagree
+  var url = V.getAttribute('data-src');
   var clip = {
     v:V, c:C, dur:0, current:0, target:0,
     bank:[], lru:new Map(), drawnIndex:-1,
@@ -670,9 +670,11 @@ function createClip(V, C){
   function prime(){
     clip.dur = V.duration || 0;
     try { V.currentTime = 0.001; } catch(e){}
+    wake();
   }
   if (V.readyState >= 1) prime();       // metadata already arrived before this ran
   V.addEventListener('loadedmetadata', prime);
+  V.addEventListener('seeked', wake);
   V.pause();
 
   clip.nearestIndex = function(t){
@@ -689,15 +691,15 @@ function createClip(V, C){
       lru.set(j, null);
       (function(idx){
         createImageBitmap(b[idx].blob).then(function(bm){
+          // An evicted pending request must not resurrect its cache entry.
+          if (!lru.has(idx)){ bm.close(); return; }
           lru.set(idx, bm);
-          if (lru.size > LRU_MAX){
-            var it = lru.keys();
-            for (var n = 0; n < lru.size - LRU_MAX; n++){
-              var key = it.next().value, old = lru.get(key);
-              if (old && old.close) old.close();
-              lru.delete(key);
-            }
+          while (lru.size > LRU_MAX){
+            var key = lru.keys().next().value, old = lru.get(key);
+            if (old && old.close) old.close();
+            lru.delete(key);
           }
+          wake();
         }).catch(function(){ lru.delete(idx); });
       })(j);
     }
@@ -912,15 +914,39 @@ var clips = [
    layers so the same frame is on every canvas at the same scroll time. */
 function shareBank(from, to){
   to.bank = from.bank;
+  to.lru = from.lru;
   to.dur = from.dur;
   to.ready = from.ready;
   to.reverted = from.reverted;
   to.drawnIndex = -1;
 }
 function buildAll(){
+  // Same full-resolution frames and timestamps as the video; prepared once
+  // instead of decoding and WebP-encoding the whole film on every visitor's CPU.
+  if (reduced) return;
+  fetch('./frames-hq.bin').then(function(r){
+    if (!r.ok) throw new Error('frame pack ' + r.status);
+    return r.arrayBuffer();
+  }).then(function(buf){
+    var n = new DataView(buf).getUint32(0, true);
+    var meta = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 4, n)));
+    var data = new Blob([buf.slice(4 + n)]), c = clips[0];
+    c.bank = meta.frames.map(function(f){
+      return {ts:f[0], blob:data.slice(f[1], f[1] + f[2], 'image/webp')};
+    });
+    c.dur = meta.duration;
+    return createImageBitmap(c.bank[0].blob).then(function(bm){
+      c.lru.set(0, bm); c.ready = true;
+      shareBank(c, clips[1]); shareBank(c, clips[2]);
+      wake();
+    });
+  }).catch(function(){
+    clips.forEach(function(c){ c.v.src = c.v.getAttribute('data-src'); });
   clips[0].build().then(function(){
     shareBank(clips[0], clips[1]);
     shareBank(clips[0], clips[2]);
+    wake();
+  });
   });
 }
 if (document.readyState === 'complete') buildAll();
@@ -1070,7 +1096,7 @@ function updateReveals(p){
   if (ra !== lastRA){
     lastRA = ra;
     revA.style.setProperty('--reveal', ra);
-    root.style.setProperty('--stage-out',
+    stageEl.style.setProperty('--stage-out',
       clamp01((ra - FADE_A[0]) / (FADE_A[1] - FADE_A[0])).toFixed(3));
     var cs = ra >= 1;
     if (cs !== coveredStage){ coveredStage = cs; stageEl.classList.toggle('is-covered', cs); }
@@ -1175,33 +1201,50 @@ function updateScrub(p, dt){
    are not guaranteed in every embedding, innerWidth is, and reading it
    costs no layout. */
 var last = performance.now(), lastVW = innerWidth, lastVH = innerHeight;
+var raf = 0, lastProgress = -1;
+function wake(){
+  if (!raf && !document.hidden){ last = performance.now(); raf = requestAnimationFrame(tick); }
+}
 function tick(now){
+  raf = 0;
   var dt = Math.min(0.1, (now - last) / 1000);
   last = now;
 
   if (innerWidth !== lastVW || innerHeight !== lastVH){
     lastVW = innerWidth; lastVH = innerHeight;
-    measure();
+    measure(); lastProgress = -1;
   }
 
   var p = progress();
-  updateTitle(p);
-  updateStats(p);
-  updateAbout(p);
-  updateReveals(p);      // before updateScrub: it sets the visibility flags
-  updateSec2(p);
+  if (p !== lastProgress){
+    updateTitle(p);
+    updateStats(p);
+    updateAbout(p);
+    updateReveals(p);
+    updateSec2(p);
+    lastProgress = p;
+  }
   updateScrub(p, dt);
 
-  requestAnimationFrame(tick);
+  if (!reduced && clips.some(function(c){ return Math.abs(c.target - c.current) > SNAP; })){
+    raf = requestAnimationFrame(tick);
+  }
 }
-requestAnimationFrame(tick);
+wake();
+addEventListener('scroll', wake, {passive:true});
+addEventListener('resize', wake, {passive:true});
+document.addEventListener('visibilitychange', function(){
+  if (document.hidden){ cancelAnimationFrame(raf); raf = 0; }
+  else { lastProgress = -1; wake(); }
+});
 
 /* small diagnostic surface — read-only, no behaviour attached */
 window.__plate = {
   get clips(){
     return clips.map(function(c){
       return { ready:c.ready, size:c.bank.length, reverted:c.reverted,
-               dur:+c.dur.toFixed(3), t:+c.current.toFixed(3), drawn:c.drawnIndex };
+               dur:+c.dur.toFixed(3), t:+c.current.toFixed(3), drawn:c.drawnIndex,
+               cached:c.lru.size };
     });
   },
   get map(){ return { span:span, wipe:+wipe.toFixed(4), A:A, B:B, titleOut:titleOut, titleIn:titleIn }; },
@@ -1226,7 +1269,7 @@ window.__plate = {
 };
 
 var rt;
-function scheduleMeasure(){ clearTimeout(rt); rt = setTimeout(measure, 120); }
+function scheduleMeasure(){ clearTimeout(rt); rt = setTimeout(function(){ measure(); lastProgress = -1; wake(); }, 120); }
 addEventListener('resize', scheduleMeasure);
 addEventListener('orientationchange', scheduleMeasure);
 addEventListener('load', measure);
