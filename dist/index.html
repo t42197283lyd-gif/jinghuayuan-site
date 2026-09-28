@@ -617,6 +617,7 @@ var BAND_BOT   = 160;            // bottom fade ramp height
 var LERP_TAU = 8;       // 1 - exp(-dt * 8), frame-rate independent
 var SNAP     = 0.002;
 var LRU_MAX  = 24;
+var bitmapPending = 0;
 var LEAD     = 24;      // max live VideoFrames during decode
 var WATCHDOG = 60000;   // generous on purpose. 15s once killed a healthy build.
 var FADE_A   = [0.93, 0.98];  // stage fades inside reveal A's tail (see CSS)
@@ -663,7 +664,7 @@ function createClip(V, C){
   var url = V.getAttribute('data-src');
   var clip = {
     v:V, c:C, dur:0, current:0, target:0,
-    bank:[], lru:new Map(), drawnIndex:-1,
+    bank:[], lru:new Map(), drawnIndex:-1, pending:0, lastWanted:-1,
     ready:false, reverted:false, painted:false, building:false, buildRun:0
   };
 
@@ -685,31 +686,58 @@ function createClip(V, C){
 
   function warm(i){
     var b = clip.bank, lru = clip.lru;
-    for (var k = -1; k <= 2; k++){
-      var j = i + k;
+    var direction = i < clip.lastWanted ? -1 : 1;
+    clip.lastWanted = i;
+    // Current frame first; limit queued decodes so a fast gesture cannot
+    // bury the useful frames behind dozens of stale requests.
+    var ahead = [0, direction];
+    for (var k = 0; k < ahead.length; k++){
+      var j = i + ahead[k];
       if (j < 0 || j >= b.length || lru.has(j)) continue;
-      lru.set(j, null);
-      (function(idx){
+      if (bitmapPending >= 4 || clip.pending >= 2) break;
+      var ticket = {pending:true};
+      lru.set(j, ticket);
+      bitmapPending++; clip.pending++;
+      while (lru.size > LRU_MAX){
+        var key = lru.keys().next().value, old = lru.get(key);
+        if (old && old.close) old.close();
+        lru.delete(key);
+      }
+      (function(idx, request){
         createImageBitmap(b[idx].blob).then(function(bm){
           // An evicted pending request must not resurrect its cache entry.
-          if (!lru.has(idx)){ bm.close(); return; }
+          if (lru.get(idx) !== request){ bm.close(); return; }
           lru.set(idx, bm);
           while (lru.size > LRU_MAX){
             var key = lru.keys().next().value, old = lru.get(key);
             if (old && old.close) old.close();
             lru.delete(key);
           }
-          wake();
-        }).catch(function(){ lru.delete(idx); });
-      })(j);
+        }).catch(function(){ if (lru.get(idx) === request) lru.delete(idx); })
+          .finally(function(){ bitmapPending--; clip.pending--; wake(); });
+      })(j, ticket);
     }
   }
 
   function drawFromBank(t){
-    var i = clip.nearestIndex(t), bm = clip.lru.get(i);
-    if (bm && i !== clip.drawnIndex){
+    var wanted = clip.nearestIndex(t), i = wanted, bm;
+    warm(wanted);
+    bm = clip.lru.get(wanted);
+    if (!bm || bm.pending){
+      var distance = Infinity;
+      // Paint the nearest completed frame while the exact one is decoding.
+      // This keeps playback moving instead of freezing until a gesture ends.
+      clip.lru.forEach(function(frame, index){
+        if (!frame || frame.pending) return;
+        var gap = Math.abs(clip.bank[index].ts - t * 1e6);
+        if (gap < distance){ distance = gap; i = index; bm = frame; }
+      });
+      if (distance > 750000) bm = null;
+    }
+    if (bm && !bm.pending && i !== clip.drawnIndex){
       ctx.drawImage(bm, 0, 0, C.width, C.height);
       clip.drawnIndex = i;
+      clip.lru.delete(i); clip.lru.set(i, bm);
       // Reveal on the first REAL paint, never on a timer: a timed fade-in
       // can uncover an empty canvas and black out the whole plate.
       if (!clip.painted && !clip.reverted){
@@ -717,7 +745,6 @@ function createClip(V, C){
         C.classList.add('is-live');
       }
     }
-    warm(i);
   }
 
   clip.render = function(t){
